@@ -2,6 +2,7 @@
 #include <ArduinoJson.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WiFi.h>
+#include <LittleFS.h>
 #include <WiFiClientSecure.h>
 
 #define MQTT_MAX_PACKET_SIZE 1024
@@ -47,6 +48,9 @@ struct WeatherData
 
 WiFiClientSecure secureClient;
 PubSubClient mqtt(secureClient);
+
+const char *PENDING_TELEMETRY_FILE = "/pending-telemetry.jsonl";
+const char *PENDING_TELEMETRY_TEMP_FILE = "/pending-telemetry.tmp";
 
 // ============================================================
 // Utilitário
@@ -106,24 +110,30 @@ void connectWiFi()
 
 void connectMQTT()
 {
-    while (!mqtt.connected())
+    static unsigned long lastAttempt = 0;
+
+    if (mqtt.connected())
+        return;
+
+    if (lastAttempt != 0 &&
+        millis() - lastAttempt < MQTT_RETRY_INTERVAL)
+        return;
+
+    lastAttempt = millis();
+
+    Serial.print("Conectando ao ThingsBoard MQTT...");
+
+    if (mqtt.connect(
+            TB_CLIENT_ID,
+            TB_USERNAME,
+            TB_PASSWORD))
     {
-        Serial.print("Conectando ao ThingsBoard MQTT...");
-
-        if (mqtt.connect(
-                TB_CLIENT_ID,
-                TB_USERNAME,
-                TB_PASSWORD))
-        {
-            Serial.println(" OK");
-        }
-        else
-        {
-            Serial.print(" FALHOU, estado = ");
-            Serial.println(mqtt.state());
-
-            delay(5000);
-        }
+        Serial.println(" OK");
+    }
+    else
+    {
+        Serial.print(" FALHOU, estado = ");
+        Serial.println(mqtt.state());
     }
 }
 
@@ -348,10 +358,10 @@ void printWeatherData(const WeatherData &d)
 }
 
 // ============================================================
-// Publicação MQTT
+// Publicação MQTT e fila LittleFS
 // ============================================================
 
-bool publishWeather(const WeatherData &d)
+void makeTelemetryPayload(const WeatherData &d, String &payload)
 {
     JsonDocument doc;
 
@@ -380,19 +390,22 @@ bool publishWeather(const WeatherData &d)
     doc["rain_year"] = d.rain_year;
     doc["rain_total"] = d.rain_total;
 
-    char payload[1024];
+    payload = "";
+    serializeJson(doc, payload);
+}
 
-    size_t len =
-        serializeJson(doc, payload, sizeof(payload));
+bool publishPayload(const String &payload)
+{
+    if (!mqtt.connected())
+        return false;
 
     Serial.print("MQTT -> ");
     Serial.println(payload);
 
-    bool result =
-        mqtt.publish(
-            TB_TOPIC,
-            payload,
-            len);
+    bool result = mqtt.publish(
+        TB_TOPIC,
+        payload.c_str(),
+        payload.length());
 
     if (result)
         Serial.println("Telemetria publicada.");
@@ -403,6 +416,95 @@ bool publishWeather(const WeatherData &d)
     }
 
     return result;
+}
+
+bool savePendingPayload(const String &payload)
+{
+    File file = LittleFS.open(PENDING_TELEMETRY_FILE, "a");
+
+    if (!file)
+    {
+        Serial.println("Falha ao abrir a fila LittleFS.");
+        return false;
+    }
+
+    bool saved = file.println(payload) > 0;
+    file.close();
+
+    if (saved)
+        Serial.println("Telemetria guardada na fila LittleFS.");
+    else
+        Serial.println("Falha ao gravar a fila LittleFS.");
+
+    return saved;
+}
+
+void publishPendingTelemetry()
+{
+    if (!mqtt.connected() || !LittleFS.exists(PENDING_TELEMETRY_FILE))
+        return;
+
+    File pending = LittleFS.open(PENDING_TELEMETRY_FILE, "r");
+    File remaining = LittleFS.open(PENDING_TELEMETRY_TEMP_FILE, "w");
+
+    if (!pending || !remaining)
+    {
+        Serial.println("Falha ao abrir a fila LittleFS para envio.");
+        if (pending)
+            pending.close();
+        if (remaining)
+            remaining.close();
+        return;
+    }
+
+    bool keepRemaining = false;
+    unsigned int published = 0;
+
+    while (pending.available())
+    {
+        String payload = pending.readStringUntil('\n');
+        payload.trim();
+
+        if (payload.length() == 0)
+            continue;
+
+        if (!keepRemaining && publishPayload(payload))
+        {
+            published++;
+        }
+        else
+        {
+            keepRemaining = true;
+            remaining.println(payload);
+        }
+    }
+
+    pending.close();
+    remaining.close();
+
+    LittleFS.remove(PENDING_TELEMETRY_FILE);
+
+    if (keepRemaining)
+        LittleFS.rename(PENDING_TELEMETRY_TEMP_FILE, PENDING_TELEMETRY_FILE);
+    else
+        LittleFS.remove(PENDING_TELEMETRY_TEMP_FILE);
+
+    if (published > 0)
+    {
+        Serial.print("Telemetrias recuperadas da fila: ");
+        Serial.println(published);
+    }
+}
+
+bool publishWeather(const WeatherData &d)
+{
+    String payload;
+    makeTelemetryPayload(d, payload);
+
+    if (publishPayload(payload))
+        return true;
+
+    return savePendingPayload(payload);
 }
 
 // ============================================================
@@ -418,6 +520,11 @@ void setup()
     Serial.println("================================");
     Serial.println("        Ecowitt2TB V2");
     Serial.println("================================");
+
+    if (!LittleFS.begin())
+    {
+        Serial.println("Falha ao montar LittleFS.");
+    }
 
     // --------------------------------------------------------
     // Wi-Fi
@@ -456,6 +563,9 @@ void loop()
     }
 
     mqtt.loop();
+
+    // Envia primeiro as amostras antigas, preservando a ordem da fila.
+    publishPendingTelemetry();
 
     static unsigned long lastUpload = 0;
 

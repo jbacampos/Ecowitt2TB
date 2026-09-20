@@ -20,3 +20,7 @@
 
 // ---------- Coleta ----------
 #define UPLOAD_INTERVAL 60000UL
+
+// ---------- Fila local ----------
+// Intervalo entre tentativas MQTT; a leitura do gateway continua mesmo sem Internet.
+#define MQTT_RETRY_INTERVAL 10000UL
