@@ -4,6 +4,7 @@
 #include <ESP8266WiFi.h>
 #include <LittleFS.h>
 #include <WiFiClientSecure.h>
+#include <time.h>
 
 #define MQTT_MAX_PACKET_SIZE 1024
 #include <PubSubClient.h>
@@ -16,6 +17,9 @@
 
 struct WeatherData
 {
+    uint64_t collectedAt;
+    bool timestampFromGateway;
+
     float temperature_out;
     float feels_like_out;
     float humidity_out;
@@ -51,6 +55,7 @@ PubSubClient mqtt(secureClient);
 
 const char *PENDING_TELEMETRY_FILE = "/pending-telemetry.jsonl";
 const char *PENDING_TELEMETRY_TEMP_FILE = "/pending-telemetry.tmp";
+const char *LEGACY_TELEMETRY_FILE = "/pending-telemetry-legacy.jsonl";
 
 // ============================================================
 // Utilitário
@@ -81,6 +86,69 @@ float getValue(JsonArray array, const char *id)
     }
 
     return NAN;
+}
+
+String getTextValue(JsonArray array, const char *id)
+{
+    for (JsonObject item : array)
+    {
+        const char *itemId = item["id"];
+        const char *value = item["val"];
+
+        if (itemId && value && strcmp(itemId, id) == 0)
+            return String(value);
+    }
+
+    return "";
+}
+
+bool isClockSynchronized()
+{
+    // Datas posteriores a 2024 indicam que o NTP já ajustou o relógio.
+    return time(nullptr) >= 1704067200;
+}
+
+uint64_t currentTimestampMs()
+{
+    return static_cast<uint64_t>(time(nullptr)) * 1000ULL +
+           (millis() % 1000UL);
+}
+
+String formatTimestamp(uint64_t timestampMs)
+{
+    time_t timestamp = static_cast<time_t>(timestampMs / 1000ULL);
+    tm timeInfo;
+    localtime_r(&timestamp, &timeInfo);
+
+    char timeText[9];
+    strftime(timeText, sizeof(timeText), "%H:%M:%S", &timeInfo);
+
+    return String(timeText);
+}
+
+uint64_t parseGatewayTimestamp(const String &timestampText)
+{
+    int year, month, day, hour, minute, second;
+    int valuesRead = sscanf(timestampText.c_str(),
+                            "%d%*[-/]%d%*[-/]%d %d:%d:%d",
+                            &year, &month, &day,
+                            &hour, &minute, &second);
+
+    if (valuesRead != 6 || year < 2024 || month < 1 || month > 12 ||
+        day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59)
+        return 0;
+
+    tm timeInfo = {};
+    timeInfo.tm_year = year - 1900;
+    timeInfo.tm_mon = month - 1;
+    timeInfo.tm_mday = day;
+    timeInfo.tm_hour = hour;
+    timeInfo.tm_min = minute;
+    timeInfo.tm_sec = second;
+    timeInfo.tm_isdst = -1;
+
+    time_t timestamp = mktime(&timeInfo);
+    return timestamp > 0 ? static_cast<uint64_t>(timestamp) * 1000ULL : 0;
 }
 
 // ============================================================
@@ -225,6 +293,17 @@ bool readEcowitt(WeatherData &data)
     data.solar_radiation =
         getValue(common, "0x15");
 
+    // O item 0x18 contém a data e hora do snapshot do GW3000.
+    String gatewayTime = getTextValue(common, "0x18");
+    data.collectedAt = parseGatewayTimestamp(gatewayTime);
+    data.timestampFromGateway = data.collectedAt != 0;
+
+    if (!data.timestampFromGateway && isClockSynchronized())
+    {
+        data.collectedAt = currentTimestampMs();
+        Serial.println("Timestamp do GW3000 indisponível; usando NTP do ESP.");
+    }
+
     // --------------------------------------------------------
     // wh25
     // --------------------------------------------------------
@@ -361,40 +440,45 @@ void printWeatherData(const WeatherData &d)
 // Publicação MQTT e fila LittleFS
 // ============================================================
 
-void makeTelemetryPayload(const WeatherData &d, String &payload)
+void makeTelemetryPayload(const WeatherData &d,
+                          uint64_t collectedAt,
+                          String &payload)
 {
     JsonDocument doc;
+    JsonObject values = doc["values"].to<JsonObject>();
 
-    doc["temperature_out"] = d.temperature_out;
-    doc["feels_like_out"] = d.feels_like_out;
-    doc["humidity_out"] = d.humidity_out;
-    doc["dew_point_out"] = d.dew_point_out;
-    doc["pressure_relative"] = d.pressure_relative;
+    doc["ts"] = collectedAt;
 
-    doc["wind_speed"] = d.wind_speed;
-    doc["wind_gust"] = d.wind_gust;
-    doc["wind_direction"] = d.wind_direction;
-    doc["wind_direction_10min"] = d.wind_direction_10min;
+    values["temperature_out"] = d.temperature_out;
+    values["feels_like_out"] = d.feels_like_out;
+    values["humidity_out"] = d.humidity_out;
+    values["dew_point_out"] = d.dew_point_out;
+    values["pressure_relative"] = d.pressure_relative;
 
-    doc["solar_radiation"] = d.solar_radiation;
+    values["wind_speed"] = d.wind_speed;
+    values["wind_gust"] = d.wind_gust;
+    values["wind_direction"] = d.wind_direction;
+    values["wind_direction_10min"] = d.wind_direction_10min;
 
-    doc["temperature_in"] = d.temperature_in;
-    doc["humidity_in"] = d.humidity_in;
+    values["solar_radiation"] = d.solar_radiation;
 
-    doc["rain_rate"] = d.rain_rate;
-    doc["rain_event"] = d.rain_event;
-    doc["rain_hour"] = d.rain_hour;
-    doc["rain_day"] = d.rain_day;
-    doc["rain_week"] = d.rain_week;
-    doc["rain_month"] = d.rain_month;
-    doc["rain_year"] = d.rain_year;
-    doc["rain_total"] = d.rain_total;
+    values["temperature_in"] = d.temperature_in;
+    values["humidity_in"] = d.humidity_in;
+
+    values["rain_rate"] = d.rain_rate;
+    values["rain_event"] = d.rain_event;
+    values["rain_hour"] = d.rain_hour;
+    values["rain_day"] = d.rain_day;
+    values["rain_week"] = d.rain_week;
+    values["rain_month"] = d.rain_month;
+    values["rain_year"] = d.rain_year;
+    values["rain_total"] = d.rain_total;
 
     payload = "";
     serializeJson(doc, payload);
 }
 
-bool publishPayload(const String &payload)
+bool publishPayload(const String &payload, uint64_t collectedAt)
 {
     if (!mqtt.connected())
         return false;
@@ -408,7 +492,12 @@ bool publishPayload(const String &payload)
         payload.length());
 
     if (result)
-        Serial.println("Telemetria publicada.");
+    {
+        Serial.print("Telemetria coletada às ");
+        Serial.print(formatTimestamp(collectedAt));
+        Serial.print(" publicada às ");
+        Serial.println(formatTimestamp(currentTimestampMs()));
+    }
     else
     {
         Serial.print("Falha ao publicar. MQTT state = ");
@@ -462,20 +551,43 @@ void publishPendingTelemetry()
 
     while (pending.available())
     {
-        String payload = pending.readStringUntil('\n');
-        payload.trim();
+        String record = pending.readStringUntil('\n');
+        record.trim();
 
-        if (payload.length() == 0)
+        if (record.length() == 0)
             continue;
 
-        if (!keepRemaining && publishPayload(payload))
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, record);
+
+        if (error || !doc["ts"].is<uint64_t>() || !doc["values"].is<JsonObject>())
+        {
+            File legacy = LittleFS.open(LEGACY_TELEMETRY_FILE, "a");
+            if (legacy)
+            {
+                legacy.println(record);
+                legacy.close();
+                Serial.println("Registro antigo movido para a fila legada sem timestamp.");
+            }
+            else
+            {
+                Serial.println("Falha ao separar registro pendente sem timestamp.");
+                keepRemaining = true;
+                remaining.println(record);
+            }
+            continue;
+        }
+
+        uint64_t collectedAt = doc["ts"].as<uint64_t>();
+
+        if (!keepRemaining && publishPayload(record, collectedAt))
         {
             published++;
         }
         else
         {
             keepRemaining = true;
-            remaining.println(payload);
+            remaining.println(record);
         }
     }
 
@@ -498,10 +610,16 @@ void publishPendingTelemetry()
 
 bool publishWeather(const WeatherData &d)
 {
-    String payload;
-    makeTelemetryPayload(d, payload);
+    if (d.collectedAt == 0)
+    {
+        Serial.println("Sem timestamp do GW3000 ou NTP; telemetria não será enviada.");
+        return false;
+    }
 
-    if (publishPayload(payload))
+    String payload;
+    makeTelemetryPayload(d, d.collectedAt, payload);
+
+    if (publishPayload(payload, d.collectedAt))
         return true;
 
     return savePendingPayload(payload);
@@ -531,6 +649,10 @@ void setup()
     // --------------------------------------------------------
 
     connectWiFi();
+
+    configTime(UTC_OFFSET_SECONDS, 0,
+               NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+    Serial.println("Sincronização NTP iniciada.");
 
     // --------------------------------------------------------
     // MQTT
@@ -563,6 +685,14 @@ void loop()
     }
 
     mqtt.loop();
+
+    static bool clockReported = false;
+    if (isClockSynchronized() && !clockReported)
+    {
+        clockReported = true;
+        Serial.print("Relógio NTP sincronizado: ");
+        Serial.println(formatTimestamp(currentTimestampMs()));
+    }
 
     // Envia primeiro as amostras antigas, preservando a ordem da fila.
     publishPendingTelemetry();

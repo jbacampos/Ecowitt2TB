@@ -24,3 +24,9 @@
 // ---------- Fila local ----------
 // Intervalo entre tentativas MQTT; a leitura do gateway continua mesmo sem Internet.
 #define MQTT_RETRY_INTERVAL 10000UL
+
+// ---------- Relógio NTP ----------
+#define NTP_SERVER_1 "time.cloudflare.com"
+#define NTP_SERVER_2 "time.google.com"
+#define NTP_SERVER_3 "pool.ntp.org"
+#define UTC_OFFSET_SECONDS (-3 * 3600) // Horário de Brasília (UTC-3)
