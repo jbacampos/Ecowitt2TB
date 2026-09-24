@@ -1119,6 +1119,54 @@ bool verifyTestRecords(const SegmentInfo &segment, uint32_t firstRecord) {
     return true;
 }
 
+bool printQueueStorageMetrics() {
+    size_t totalBytes, usedBytes;
+    if (!getFilesystemSpace(totalBytes, usedBytes) || segments.empty()) {
+        Serial.println("QUEUE: medição indisponível (LittleFS/segmentos).");
+        return false;
+    }
+
+    uint32_t recordCount = 0;
+    size_t queueBytes = 0;
+    for (const auto &segment : segments) {
+        File file = LittleFS.open(segment.path, "r");
+        if (!file) {
+            Serial.println("QUEUE: medição indisponível (falha ao abrir segmento).");
+            return false;
+        }
+        queueBytes += file.size();
+        file.close();
+        recordCount += segment.count;
+    }
+    if (!recordCount || usedBytes < queueBytes ||
+        totalBytes <= usedBytes - queueBytes + FILESYSTEM_SAFETY_MARGIN) {
+        Serial.println("QUEUE: medição indisponível (capacidade útil insuficiente).");
+        return false;
+    }
+
+    const double bytesPerRecord = static_cast<double>(queueBytes) / recordCount;
+    const double recordsPerMb = 1000000.0 / bytesPerRecord;
+    // Preserve current non-queue filesystem usage and the queue's existing
+    // safety margin when estimating the space available to future queue data.
+    const size_t queueCapacityBytes = totalBytes - (usedBytes - queueBytes) -
+                                      FILESYSTEM_SAFETY_MARGIN;
+    const double estimatedRecords = queueCapacityBytes / bytesPerRecord;
+    const double estimatedHours = estimatedRecords / 60.0;
+    const double estimatedDays = estimatedHours / 24.0;
+
+    Serial.printf("QUEUE: %lu registros\n", static_cast<unsigned long>(recordCount));
+    Serial.printf("QUEUE: %lu segmentos\n", static_cast<unsigned long>(segments.size()));
+    Serial.printf("QUEUE: %lu bytes\n", static_cast<unsigned long>(queueBytes));
+    Serial.printf("QUEUE: %.1f bytes/registro\n", bytesPerRecord);
+    Serial.printf("QUEUE: ~%.0f registros/MB\n", recordsPerMb);
+    Serial.printf("QUEUE: ~%.0f horas @ 1 registro/min\n", estimatedHours);
+    Serial.printf("QUEUE: ~%.2f dias @ 1 registro/min\n", estimatedDays);
+    Serial.printf("QUEUE: capacidade estimada=%lu bytes (LittleFS útil menos uso não-fila e margem de %lu bytes)\n",
+                  static_cast<unsigned long>(queueCapacityBytes),
+                  static_cast<unsigned long>(FILESYSTEM_SAFETY_MARGIN));
+    return true;
+}
+
 bool captureSequenceMetadataBeforeRecovery() {
     queueFsTestMetaSnapshotValid = false;
     for (int slot = 0; slot < 2; ++slot) {
@@ -1194,6 +1242,7 @@ bool startQueueFsRebootTest() {
     }
     if (segments.size() != 1 || segments[0].sequence != firstSegment ||
         segments[0].firstRecordSequence != firstRecord || !closeSegment(segments[0])) return false;
+    if (!printQueueStorageMetrics()) return false;
     QueueFsTestState state = {QUEUE_FS_TEST_EXPECT_SEGMENT, firstSegment, firstRecord};
     if (!writeQueueFsTestState(state)) return false;
     Serial.println("TEST: segmento com footer e 3 registros persistido; não removido.");
