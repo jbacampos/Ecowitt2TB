@@ -9,3 +9,31 @@ in the development cycle.
 
 More information about PlatformIO Unit Testing:
 - https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+
+## ESP8266 LittleFS physical-reboot queue integration test
+
+This opt-in test uses real LittleFS and physical ESP8266 resets; it does not
+connect to Wi-Fi/MQTT, call `LittleFS.end()/begin()` as a reboot, format the
+filesystem, or reset the board automatically. Use a dedicated test board and
+LittleFS with no production data. The test stops on any unexpected queue data.
+
+1. Build only: `pio run -e esp8266-queue-fs-test`.
+2. When hardware testing is authorized, install this test firmware on the
+   dedicated board and open the serial monitor at 115200 baud.
+3. Send `t`. It creates three records, closes the segment with its footer,
+   persists a phase marker and leaves the segment in LittleFS.
+4. When `TEST PRONTO PARA REBOOT FÍSICO` appears, send `r`, then physically
+   press RESET. On the next boot, normal test setup mounts LittleFS and calls
+   `recoverQueue()`. It checks segment identity, footer, record contents and
+   sequence range, then removes the segment and confirms the queue is empty.
+5. Send `r` and physically press RESET again. Boot recovery must find an empty
+   queue; it explicitly checks both `/q-seq-a.dat` and `/q-seq-b.dat` high-water
+   marks, writes and closes a new record, and checks its segment and record
+   sequences are greater than the first run's sequences. It removes this final
+   test segment and reports `RESULTADO: PASS`.
+
+Do not send `t` again while a phase marker exists. If a reboot occurs before
+the serial confirmation, the same phase remains pending and can be physically
+rebooted again after checking the serial output. The default `esp8266`
+environment does not enable this test mode. No upload is performed by the build
+command above.
