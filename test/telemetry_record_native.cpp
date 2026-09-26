@@ -7,7 +7,7 @@
 
 int main() {
     telemetry_queue::Values input = {};
-    for (uint8_t i = 0; i < 20; ++i)
+    for (uint8_t i = 0; i < 22; ++i)
         input.value[i] = static_cast<float>(i) * 1.25f;
     input.value[7] = NAN;
 
@@ -20,7 +20,7 @@ int main() {
     assert(telemetry_queue::decodeRecord(encoded, 0x12345678u,
                                          timestamp, decoded));
     assert(timestamp == 0x123456789abcdef0ULL);
-    for (uint8_t i = 0; i < 20; ++i) {
+    for (uint8_t i = 0; i < 22; ++i) {
         if (i == 7)
             assert(isnan(decoded.value[i]));
         else

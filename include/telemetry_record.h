@@ -6,13 +6,13 @@
 
 namespace telemetry_queue {
 
-static const uint16_t RECORD_SIZE = 104;
-static const uint8_t RECORD_VERSION = 1;
+static const uint16_t RECORD_SIZE = 112;
+static const uint8_t RECORD_VERSION = 2;
 static const uint16_t RECORD_MAGIC = 0x5154;
 static const uint32_t MAX_RECORDS_PER_SEGMENT = 32;
 
 struct Values {
-    float value[20];
+    float value[22];
 };
 
 inline uint32_t crc32(const uint8_t *data, size_t length) {
@@ -61,7 +61,7 @@ inline uint64_t get64(const uint8_t *in) {
 
 inline void encodeRecord(uint8_t out[RECORD_SIZE], uint32_t sequence,
                          uint64_t timestamp, const Values &values) {
-    static_assert(sizeof(float) == 4, "Record v1 requires IEEE-754 float32");
+    static_assert(sizeof(float) == 4, "Record v2 requires IEEE-754 float32");
     memset(out, 0, RECORD_SIZE);
     put16(out, RECORD_MAGIC);
     out[2] = RECORD_VERSION;
@@ -70,7 +70,7 @@ inline void encodeRecord(uint8_t out[RECORD_SIZE], uint32_t sequence,
     put64(out + 9, timestamp);
 
     uint32_t presence = 0;
-    for (uint8_t i = 0; i < 20; ++i) {
+    for (uint8_t i = 0; i < 22; ++i) {
         uint8_t *slot = out + 20 + 4 * i;
         if (!isnan(values.value[i])) {
             presence |= (1UL << i);
@@ -82,21 +82,21 @@ inline void encodeRecord(uint8_t out[RECORD_SIZE], uint32_t sequence,
     out[17] = static_cast<uint8_t>(presence);
     out[18] = static_cast<uint8_t>(presence >> 8);
     out[19] = static_cast<uint8_t>(presence >> 16);
-    put32(out + 100, crc32(out, 100));
+    put32(out + 108, crc32(out, 108));
 }
 
 inline bool decodeRecord(const uint8_t in[RECORD_SIZE], uint32_t expectedSequence,
                          uint64_t &timestamp, Values &values) {
     if (get16(in) != RECORD_MAGIC || in[2] != RECORD_VERSION ||
         get16(in + 3) != RECORD_SIZE || get32(in + 5) != expectedSequence ||
-        get32(in + 100) != crc32(in, 100))
+        get32(in + 108) != crc32(in, 108))
         return false;
 
     timestamp = get64(in + 9);
     const uint32_t presence = static_cast<uint32_t>(in[17]) |
         (static_cast<uint32_t>(in[18]) << 8) |
         (static_cast<uint32_t>(in[19]) << 16);
-    for (uint8_t i = 0; i < 20; ++i) {
+    for (uint8_t i = 0; i < 22; ++i) {
         if (presence & (1UL << i))
         {
             uint32_t bits = get32(in + 20 + 4 * i);
